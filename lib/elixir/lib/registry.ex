@@ -187,7 +187,7 @@ defmodule Registry do
   Note that the registry uses one ETS table plus two ETS tables per partition.
   """
 
-  @keys [:unique, :duplicate, {:duplicate, :key}, {:duplicate, :pid}]
+  @keys [:unique, :duplicate, {:duplicate, :key}, {:duplicate, :pid}, {:duplicate, :ordered}]
   @all_info -1
   @key_info -2
 
@@ -195,7 +195,8 @@ defmodule Registry do
   @type registry :: atom
 
   @typedoc "The type of the registry"
-  @type keys :: :unique | :duplicate | {:duplicate, :key} | {:duplicate, :pid}
+  @type keys ::
+          :unique | :duplicate | {:duplicate, :key} | {:duplicate, :pid} | {:duplicate, :ordered}
 
   @typedoc "The type of keys allowed on registration"
   @type key :: term
@@ -267,6 +268,9 @@ defmodule Registry do
         end
 
       {{:duplicate, _}, _, _} ->
+        raise ArgumentError, ":via is not supported for duplicate registries"
+
+      {{:duplicate, _, :ordered}, _, _} ->
         raise ArgumentError, ":via is not supported for duplicate registries"
     end
   end
@@ -347,7 +351,7 @@ defmodule Registry do
   The registry requires the following keys:
 
     * `:keys` - chooses if keys are `:unique`, `:duplicate`,
-      `{:duplicate, :key}`, or `{:duplicate, :pid}`
+      `{:duplicate, :key}`, `{:duplicate, :pid}`, or `{:duplicate, :ordered}`
     * `:name` - the name of the registry and its tables
 
   The following keys are optional:
@@ -371,6 +375,13 @@ defmodule Registry do
       key-based lookups more efficient as they only need to check a single partition
       instead of all partitions.
 
+    * `{:duplicate, :ordered}` - Use an `ordered_set` ETS table for key storage
+      instead of the default `duplicate_bag`. This changes the internal entry
+      format to use composite keys `{key, pid, counter}`, enabling O(log N)
+      per-process unregistration instead of O(k) full-key scans. This is beneficial
+      when processes frequently register and unregister under keys that have many
+      entries from other processes. Uses `:pid` partitioning.
+
   """
   @doc since: "1.5.0"
   @spec start_link([start_option]) :: {:ok, pid} | {:error, term}
@@ -383,6 +394,9 @@ defmodule Registry do
         {:duplicate, partition_strategy} when partition_strategy in [:key, :pid] ->
           {:duplicate, partition_strategy}
 
+        {:duplicate, :ordered} ->
+          {:duplicate, :pid, :ordered}
+
         :unique ->
           :unique
 
@@ -391,7 +405,8 @@ defmodule Registry do
 
         _ ->
           raise ArgumentError,
-                "expected :keys to be given and be one of :unique, :duplicate, {:duplicate, :key}, or {:duplicate, :pid}, got: #{inspect(keys)}"
+                "expected :keys to be given and be one of :unique, :duplicate, " <>
+                  "{:duplicate, :key}, {:duplicate, :pid}, or {:duplicate, :ordered}, got: #{inspect(keys)}"
       end
 
     name =
@@ -554,6 +569,20 @@ defmodule Registry do
         |> List.wrap()
         |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
 
+      {{:duplicate, _, :ordered}, 1, key_ets} ->
+        key_ets
+        |> ordered_lookup_second(key)
+        |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
+
+      {{:duplicate, _, :ordered}, partitions, _} ->
+        if Keyword.get(opts, :parallel, false) do
+          registry
+          |> ordered_dispatch_parallel(key, mfa_or_fun, partitions)
+          |> Enum.each(&Task.await(&1, :infinity))
+        else
+          ordered_dispatch_serial(registry, key, mfa_or_fun, partitions)
+        end
+
       {{:duplicate, _}, 1, key_ets} ->
         key_ets
         |> safe_lookup_second(key)
@@ -607,6 +636,43 @@ defmodule Registry do
       end)
 
     [task | dispatch_parallel(registry, key, mfa_or_fun, partition)]
+  end
+
+  defp ordered_dispatch_serial(_registry, _key, _mfa_or_fun, 0) do
+    :ok
+  end
+
+  defp ordered_dispatch_serial(registry, key, mfa_or_fun, partition) do
+    partition = partition - 1
+
+    registry
+    |> key_ets!(partition)
+    |> ordered_lookup_second(key)
+    |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
+
+    ordered_dispatch_serial(registry, key, mfa_or_fun, partition)
+  end
+
+  defp ordered_dispatch_parallel(_registry, _key, _mfa_or_fun, 0) do
+    []
+  end
+
+  defp ordered_dispatch_parallel(registry, key, mfa_or_fun, partition) do
+    partition = partition - 1
+    parent = self()
+
+    task =
+      Task.async(fn ->
+        registry
+        |> key_ets!(partition)
+        |> ordered_lookup_second(key)
+        |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
+
+        Process.unlink(parent)
+        :ok
+      end)
+
+    [task | ordered_dispatch_parallel(registry, key, mfa_or_fun, partition)]
   end
 
   defp apply_non_empty_to_mfa_or_fun([], _mfa_or_fun) do
@@ -670,6 +736,14 @@ defmodule Registry do
           _ ->
             []
         end
+
+      {{:duplicate, _, :ordered}, 1, key_ets} ->
+        ordered_lookup_second(key_ets, key)
+
+      {{:duplicate, _, :ordered}, partitions, _key_ets} ->
+        for partition <- 0..(partitions - 1),
+            pair <- ordered_lookup_second(key_ets!(registry, partition), key),
+            do: pair
 
       {{:duplicate, _}, 1, key_ets} ->
         safe_lookup_second(key_ets, key)
@@ -791,18 +865,33 @@ defmodule Registry do
   @doc since: "1.4.0"
   @spec match(registry, key, match_pattern, guards) :: [{pid, term}]
   def match(registry, key, pattern, guards \\ []) when is_atom(registry) and is_list(guards) do
-    guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
-    spec = [{{:_, {:_, pattern}}, guards, [{:element, 2, :"$_"}]}]
-
     case key_info!(registry) do
       {:unique, partitions, key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [{:element, 2, :"$_"}]}]
         key_ets = key_ets || key_ets!(registry, key, partitions)
         :ets.select(key_ets, spec)
 
+      {{:duplicate, _, :ordered}, 1, key_ets} ->
+        spec = ordered_match_spec(key, pattern, guards)
+        :ets.select(key_ets, spec)
+
+      {{:duplicate, _, :ordered}, partitions, _key_ets} ->
+        spec = ordered_match_spec(key, pattern, guards)
+
+        for partition <- 0..(partitions - 1),
+            pair <- :ets.select(key_ets!(registry, partition), spec),
+            do: pair
+
       {{:duplicate, _}, 1, key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [{:element, 2, :"$_"}]}]
         :ets.select(key_ets, spec)
 
       {{:duplicate, _}, partitions, _key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [{:element, 2, :"$_"}]}]
+
         for partition <- 0..(partitions - 1),
             pair <- :ets.select(key_ets!(registry, partition), spec),
             do: pair
@@ -951,6 +1040,14 @@ defmodule Registry do
             []
         end
 
+      {{:duplicate, _, :ordered}, 1, key_ets} ->
+        for {^pid, value} <- ordered_lookup_second(key_ets, key), do: value
+
+      {{:duplicate, _, :ordered}, partitions, _key_ets} ->
+        partition = hash(pid, partitions)
+        key_ets = key_ets!(registry, partition)
+        for {^pid, value} <- ordered_lookup_second(key_ets, key), do: value
+
       {{:duplicate, _}, 1, key_ets} ->
         for {^pid, value} <- safe_lookup_second(key_ets, key), do: value
 
@@ -1016,7 +1113,12 @@ defmodule Registry do
     # Remove first from the key_ets because in case of crashes
     # the pid_ets will still be able to clean up. The last step is
     # to clean if we have no more entries.
-    true = __unregister__(key_ets, {key, {self, :_}}, 1)
+    if ordered?(kind) do
+      true = ordered_unregister_key(key_ets, key, self)
+    else
+      true = __unregister__(key_ets, {key, {self, :_}}, 1)
+    end
+
     true = __unregister__(pid_ets, {self, key, key_ets, :_}, 2)
 
     unlink_if_unregistered(pid_server, pid_ets, self)
@@ -1080,16 +1182,14 @@ defmodule Registry do
     # the pid_ets will still be able to clean up. The last step is
     # to clean if we have no more entries.
 
-    # Here we want to count all entries for this pid under this key, regardless of pattern.
-    underscore_guard = {:"=:=", {:element, 1, :"$_"}, {:const, key}}
-    total_spec = [{{:_, {self, :_}}, [underscore_guard], [true]}]
-    total = :ets.select_count(key_ets, total_spec)
+    {total, delete_count} =
+      if ordered?(kind) do
+        ordered_unregister_match_counts(key_ets, key, self, pattern, guards)
+      else
+        unregister_match_counts(key_ets, key, self, pattern, guards)
+      end
 
-    # We only want to delete things that match the pattern
-    delete_spec = [{{:_, {self, pattern}}, [underscore_guard | guards], [true]}]
-
-    case :ets.select_delete(key_ets, delete_spec) do
-      # We deleted everything, we can just delete the object
+    case delete_count do
       ^total ->
         true = __unregister__(pid_ets, {self, key, key_ets, :_}, 2)
         unlink_if_unregistered(pid_server, pid_ets, self)
@@ -1119,6 +1219,28 @@ defmodule Registry do
     end
 
     :ok
+  end
+
+  defp unregister_match_counts(key_ets, key, self, pattern, guards) do
+    underscore_guard = {:"=:=", {:element, 1, :"$_"}, {:const, key}}
+    total_spec = [{{:_, {self, :_}}, [underscore_guard], [true]}]
+    total = :ets.select_count(key_ets, total_spec)
+
+    delete_spec = [{{:_, {self, pattern}}, [underscore_guard | guards], [true]}]
+    delete_count = :ets.select_delete(key_ets, delete_spec)
+    {total, delete_count}
+  end
+
+  defp ordered_unregister_match_counts(key_ets, key, self, pattern, guards) do
+    key_guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
+    pid_guard = {:"=:=", {:element, 2, {:element, 1, :"$_"}}, {:const, self}}
+
+    total_spec = [{{{:_, :_, :_}, :_}, [key_guard, pid_guard], [true]}]
+    total = :ets.select_count(key_ets, total_spec)
+
+    delete_spec = [{{{:_, :_, :_}, pattern}, [key_guard, pid_guard | guards], [true]}]
+    delete_count = :ets.select_delete(key_ets, delete_spec)
+    {total, delete_count}
   end
 
   @doc """
@@ -1180,7 +1302,14 @@ defmodule Registry do
     counter = System.unique_integer()
     true = :ets.insert(pid_ets, {self, key, key_ets, counter})
 
-    case register_key(kind, key_ets, key, {key, {self, value}}) do
+    key_entry =
+      if ordered?(kind) do
+        {{key, self, counter}, value}
+      else
+        {key, {self, value}}
+      end
+
+    case register_key(kind, key_ets, key, key_entry) do
       :ok ->
         for listener <- listeners do
           Kernel.send(listener, {:register, registry, key, self, value})
@@ -1200,6 +1329,11 @@ defmodule Registry do
   end
 
   defp register_key({:duplicate, _}, key_ets, _key, entry) do
+    true = :ets.insert(key_ets, entry)
+    :ok
+  end
+
+  defp register_key({:duplicate, _, :ordered}, key_ets, _key, entry) do
     true = :ets.insert(key_ets, entry)
     :ok
   end
@@ -1409,18 +1543,33 @@ defmodule Registry do
   @spec count_match(registry, key, match_pattern, guards) :: non_neg_integer()
   def count_match(registry, key, pattern, guards \\ [])
       when is_atom(registry) and is_list(guards) do
-    guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
-    spec = [{{:_, {:_, pattern}}, guards, [true]}]
-
     case key_info!(registry) do
       {:unique, partitions, key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [true]}]
         key_ets = key_ets || key_ets!(registry, key, partitions)
         :ets.select_count(key_ets, spec)
 
+      {{:duplicate, _, :ordered}, 1, key_ets} ->
+        spec = ordered_count_match_spec(key, pattern, guards)
+        :ets.select_count(key_ets, spec)
+
+      {{:duplicate, _, :ordered}, partitions, _key_ets} ->
+        spec = ordered_count_match_spec(key, pattern, guards)
+
+        Enum.sum_by(0..(partitions - 1), fn partition_index ->
+          :ets.select_count(key_ets!(registry, partition_index), spec)
+        end)
+
       {{:duplicate, _}, 1, key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [true]}]
         :ets.select_count(key_ets, spec)
 
       {{:duplicate, _}, partitions, _key_ets} ->
+        guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
+        spec = [{{:_, {:_, pattern}}, guards, [true]}]
+
         Enum.sum_by(0..(partitions - 1), fn partition_index ->
           :ets.select_count(key_ets!(registry, partition_index), spec)
         end)
@@ -1479,15 +1628,16 @@ defmodule Registry do
   @spec select(registry, spec) :: [term]
   def select(registry, spec)
       when is_atom(registry) and is_list(spec) do
-    spec = group_match_headers(spec, __ENV__.function)
-
     case key_info!(registry) do
-      {_kind, partitions, nil} ->
+      {kind, partitions, nil} ->
+        spec = group_match_headers(spec, __ENV__.function, kind)
+
         Enum.flat_map(0..(partitions - 1), fn partition_index ->
           :ets.select(key_ets!(registry, partition_index), spec)
         end)
 
-      {_kind, 1, key_ets} ->
+      {kind, 1, key_ets} ->
+        spec = group_match_headers(spec, __ENV__.function, kind)
         :ets.select(key_ets, spec)
     end
   end
@@ -1510,24 +1660,36 @@ defmodule Registry do
   @spec count_select(registry, spec) :: non_neg_integer()
   def count_select(registry, spec)
       when is_atom(registry) and is_list(spec) do
-    spec = group_match_headers(spec, __ENV__.function)
-
     case key_info!(registry) do
-      {_kind, partitions, nil} ->
+      {kind, partitions, nil} ->
+        spec = group_match_headers(spec, __ENV__.function, kind)
+
         Enum.sum_by(0..(partitions - 1), fn partition_index ->
           :ets.select_count(key_ets!(registry, partition_index), spec)
         end)
 
-      {_kind, 1, key_ets} ->
+      {kind, 1, key_ets} ->
+        spec = group_match_headers(spec, __ENV__.function, kind)
         :ets.select_count(key_ets, spec)
     end
   end
 
-  defp group_match_headers(spec, {fun, arity}) do
+  defp group_match_headers(spec, {fun, arity}, kind) do
     for part <- spec do
       case part do
         {{key, pid, value}, guards, select} ->
-          {{key, {pid, value}}, guards, select}
+          if ordered?(kind) do
+            # For ordered_set, ETS format is {{key, pid, counter}, value}.
+            # Transform {key, pid, value} -> {{key, pid, :_}, value}.
+            # Also transform body/guard references to :"$_" since the
+            # ETS row structure is different from non-ordered.
+            match = {{key, pid, :_}, value}
+            guards = Enum.map(guards, &ordered_rewrite_dollar_underscore/1)
+            select = Enum.map(select, &ordered_rewrite_dollar_underscore/1)
+            {match, guards, select}
+          else
+            {{key, {pid, value}}, guards, select}
+          end
 
         _ ->
           raise ArgumentError,
@@ -1536,13 +1698,40 @@ defmodule Registry do
     end
   end
 
+  # Rewrite :"$_" references in guards/body for ordered_set.
+  # In non-ordered, :"$_" is {key, {pid, value}} (2-element tuple).
+  # In ordered, :"$_" is {{key, pid, counter}, value} (2-element tuple).
+  # {:element, 1, :"$_"} = key in non-ordered; = {key, pid, counter} in ordered.
+  # We rewrite {:element, 1, :"$_"} to {:element, 1, {:element, 1, :"$_"}} to get the key.
+  defp ordered_rewrite_dollar_underscore({:element, 1, :"$_"}) do
+    {:element, 1, {:element, 1, :"$_"}}
+  end
+
+  defp ordered_rewrite_dollar_underscore(tuple) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&ordered_rewrite_dollar_underscore/1)
+    |> List.to_tuple()
+  end
+
+  defp ordered_rewrite_dollar_underscore(list) when is_list(list) do
+    Enum.map(list, &ordered_rewrite_dollar_underscore/1)
+  end
+
+  defp ordered_rewrite_dollar_underscore(other) do
+    other
+  end
+
   ## Helpers
 
-  @compile {:inline, hash: 2}
+  @compile {:inline, hash: 2, ordered?: 1}
 
   defp hash(term, limit) do
     :erlang.phash2(term, limit)
   end
+
+  defp ordered?({:duplicate, _, :ordered}), do: true
+  defp ordered?(_), do: false
 
   defp info!(registry) do
     try do
@@ -1586,6 +1775,44 @@ defmodule Registry do
     end
   end
 
+  defp ordered_lookup_second(ets, key) do
+    # For ordered_set, keys are {key, pid, counter} composite tuples.
+    # We use select to find all entries matching the key prefix.
+    # Reserved atoms like :_ or :"$1" need guard-based comparison.
+    spec =
+      if is_atom(key) and reserved_atom?(Atom.to_string(key)) do
+        guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
+        [{{:_, :_}, [guard], [:"$_"]}]
+      else
+        [{{{key, :_, :_}, :_}, [], [:"$_"]}]
+      end
+
+    try do
+      for {{_key, pid, _counter}, value} <- :ets.select(ets, spec), do: {pid, value}
+    catch
+      :error, :badarg -> []
+    end
+  end
+
+  # Build match spec for ordered_set match/4.
+  # Entry format: {{key, pid, counter}, value}
+  # Returns [{pid, value}] pairs.
+  defp ordered_match_spec(key, pattern, guards) do
+    key_guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
+    all_guards = [key_guard | guards]
+    # Tuples in match spec bodies need extra wrapping to be returned as values
+    body = [{{{:element, 2, {:element, 1, :"$_"}}, {:element, 2, :"$_"}}}]
+    [{{{:_, :_, :_}, pattern}, all_guards, body}]
+  end
+
+  # Build match spec for ordered_set count_match/4.
+  # Entry format: {{key, pid, counter}, value}
+  defp ordered_count_match_spec(key, pattern, guards) do
+    key_guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
+    all_guards = [key_guard | guards]
+    [{{{:_, :_, :_}, pattern}, all_guards, [true]}]
+  end
+
   defp partitions(:unique, key, pid, partitions) do
     {hash(key, partitions), hash(pid, partitions)}
   end
@@ -1596,6 +1823,11 @@ defmodule Registry do
   end
 
   defp partitions({:duplicate, :pid}, _key, pid, partitions) do
+    partition = hash(pid, partitions)
+    {partition, partition}
+  end
+
+  defp partitions({:duplicate, :pid, :ordered}, _key, pid, partitions) do
     partition = hash(pid, partitions)
     {partition, partition}
   end
@@ -1617,6 +1849,17 @@ defmodule Registry do
       :ets.select_delete(table, [{match, [guard], [true]}]) >= 0
     else
       :ets.match_delete(table, match)
+    end
+  end
+
+  @doc false
+  def ordered_unregister_key(key_ets, key, pid) do
+    if is_atom(key) and reserved_atom?(Atom.to_string(key)) do
+      guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
+      pid_guard = {:"=:=", {:element, 2, {:element, 1, :"$_"}}, {:const, pid}}
+      :ets.select_delete(key_ets, [{{:_, :_}, [guard, pid_guard], [true]}]) >= 0
+    else
+      :ets.match_delete(key_ets, {{key, pid, :_}, :_})
     end
   end
 
@@ -1663,6 +1906,7 @@ defmodule Registry.Supervisor do
   # This means that, if a PID or key partition crashes, all of
   # its associated entries are in its sibling table, so we crash one.
   defp strategy_for_kind({:duplicate, _}), do: :one_for_one
+  defp strategy_for_kind({:duplicate, _, :ordered}), do: :one_for_one
 end
 
 defmodule Registry.Partition do
@@ -1734,7 +1978,13 @@ defmodule Registry.Partition do
       true = :ets.insert(registry, {i, key_ets, {self(), pid_ets}})
     end
 
-    {:ok, {pid_ets, %{}}}
+    ordered =
+      case kind do
+        {:duplicate, _, :ordered} -> true
+        _ -> false
+      end
+
+    {:ok, {pid_ets, %{}, ordered}}
   end
 
   # The key partition is a set for unique keys,
@@ -1746,6 +1996,11 @@ defmodule Registry.Partition do
 
   defp init_key_ets({:duplicate, _}, key_partition, compressed) do
     opts = [:duplicate_bag, :public, read_concurrency: true, write_concurrency: true]
+    :ets.new(key_partition, compression_opt(opts, compressed))
+  end
+
+  defp init_key_ets({:duplicate, _, :ordered}, key_partition, compressed) do
+    opts = [:ordered_set, :public, read_concurrency: true, write_concurrency: true]
     :ets.new(key_partition, compression_opt(opts, compressed))
   end
 
@@ -1768,7 +2023,7 @@ defmodule Registry.Partition do
     {:reply, :ok, state}
   end
 
-  def handle_call({:lock, key}, from, {ets, lock}) do
+  def handle_call({:lock, key}, from, {ets, lock, ordered}) do
     lock =
       case lock do
         %{^key => queue} ->
@@ -1779,10 +2034,10 @@ defmodule Registry.Partition do
           Map.put(lock, key, :queue.new())
       end
 
-    {:noreply, {ets, lock}}
+    {:noreply, {ets, lock, ordered}}
   end
 
-  def handle_info({:EXIT, pid, _reason}, {ets, lock}) do
+  def handle_info({:EXIT, pid, _reason}, {ets, lock, ordered}) do
     entries = :ets.take(ets, pid)
 
     for {_pid, key, key_ets, _counter} <- entries do
@@ -1797,13 +2052,17 @@ defmodule Registry.Partition do
         end
 
       try do
-        Registry.__unregister__(key_ets, {key, {pid, :_}}, 1)
+        if ordered do
+          Registry.ordered_unregister_key(key_ets, key, pid)
+        else
+          Registry.__unregister__(key_ets, {key, {pid, :_}}, 1)
+        end
       catch
         :error, :badarg -> :badarg
       end
     end
 
-    {:noreply, {ets, lock}}
+    {:noreply, {ets, lock, ordered}}
   end
 
   def handle_info({{:unlock, key}, _ref, :process, _pid, _reason}, state) do
@@ -1815,7 +2074,7 @@ defmodule Registry.Partition do
     unlock(key, state)
   end
 
-  defp unlock(key, {ets, lock}) do
+  defp unlock(key, {ets, lock, ordered}) do
     %{^key => queue} = lock
 
     lock =
@@ -1824,7 +2083,7 @@ defmodule Registry.Partition do
         {:not_empty, queue} -> Map.put(lock, key, queue)
       end
 
-    {:noreply, {ets, lock}}
+    {:noreply, {ets, lock, ordered}}
   end
 
   defp dequeue(queue, key) do

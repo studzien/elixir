@@ -14,7 +14,7 @@ defmodule Registry.Test do
     async: true,
     parameterize:
       for(
-        keys <- [:unique, :duplicate, {:duplicate, :pid}, {:duplicate, :key}],
+        keys <- [:unique, :duplicate, {:duplicate, :pid}, {:duplicate, :key}, {:duplicate, :ordered}],
         partitions <- [1, 8],
         do: %{keys: keys, partitions: partitions}
       )
