@@ -1777,18 +1777,20 @@ defmodule Registry do
 
   defp ordered_lookup_second(ets, key) do
     # For ordered_set, keys are {key, pid, counter} composite tuples.
-    # We use select to find all entries matching the key prefix.
+    # We use select to find all entries matching the key prefix and
+    # construct {pid, value} pairs directly in the match spec to avoid
+    # an extra list traversal in Elixir.
     # Reserved atoms like :_ or :"$1" need guard-based comparison.
     spec =
       if is_atom(key) and reserved_atom?(Atom.to_string(key)) do
         guard = {:"=:=", {:element, 1, {:element, 1, :"$_"}}, {:const, key}}
-        [{{:_, :_}, [guard], [:"$_"]}]
+        [{{{:_, :"$1", :_}, :"$2"}, [guard], [{{:"$1", :"$2"}}]}]
       else
-        [{{{key, :_, :_}, :_}, [], [:"$_"]}]
+        [{{{key, :"$1", :_}, :"$2"}, [], [{{:"$1", :"$2"}}]}]
       end
 
     try do
-      for {{_key, pid, _counter}, value} <- :ets.select(ets, spec), do: {pid, value}
+      :ets.select(ets, spec)
     catch
       :error, :badarg -> []
     end
