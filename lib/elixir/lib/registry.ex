@@ -401,7 +401,7 @@ defmodule Registry do
           :unique
 
         :duplicate ->
-          {:duplicate, :pid}
+          {:duplicate, :pid, :ordered}
 
         _ ->
           raise ArgumentError,
