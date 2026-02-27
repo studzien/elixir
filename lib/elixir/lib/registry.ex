@@ -395,13 +395,13 @@ defmodule Registry do
           {:duplicate, partition_strategy}
 
         {:duplicate, :ordered} ->
-          {:duplicate, :pid, :ordered}
+          {:duplicate, :key, :ordered}
 
         :unique ->
           :unique
 
         :duplicate ->
-          {:duplicate, :pid, :ordered}
+          {:duplicate, :pid}
 
         _ ->
           raise ArgumentError,
@@ -575,13 +575,9 @@ defmodule Registry do
         |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
 
       {{:duplicate, _, :ordered}, partitions, _} ->
-        if Keyword.get(opts, :parallel, false) do
-          registry
-          |> ordered_dispatch_parallel(key, mfa_or_fun, partitions)
-          |> Enum.each(&Task.await(&1, :infinity))
-        else
-          ordered_dispatch_serial(registry, key, mfa_or_fun, partitions)
-        end
+        key_ets!(registry, key, partitions)
+        |> ordered_lookup_second(key)
+        |> apply_non_empty_to_mfa_or_fun(mfa_or_fun)
 
       {{:duplicate, _}, 1, key_ets} ->
         key_ets
@@ -741,9 +737,7 @@ defmodule Registry do
         ordered_lookup_second(key_ets, key)
 
       {{:duplicate, _, :ordered}, partitions, _key_ets} ->
-        for partition <- 0..(partitions - 1),
-            pair <- ordered_lookup_second(key_ets!(registry, partition), key),
-            do: pair
+        ordered_lookup_second(key_ets!(registry, key, partitions), key)
 
       {{:duplicate, _}, 1, key_ets} ->
         safe_lookup_second(key_ets, key)
@@ -878,10 +872,7 @@ defmodule Registry do
 
       {{:duplicate, _, :ordered}, partitions, _key_ets} ->
         spec = ordered_match_spec(key, pattern, guards)
-
-        for partition <- 0..(partitions - 1),
-            pair <- :ets.select(key_ets!(registry, partition), spec),
-            do: pair
+        :ets.select(key_ets!(registry, key, partitions), spec)
 
       {{:duplicate, _}, 1, key_ets} ->
         guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
@@ -942,6 +933,12 @@ defmodule Registry do
       else
         case kind do
           {:duplicate, :key} ->
+            for partition <- 0..(partitions - 1) do
+              {_, pid_ets} = pid_ets!(registry, partition)
+              pid_ets
+            end
+
+          {:duplicate, :key, :ordered} ->
             for partition <- 0..(partitions - 1) do
               {_, pid_ets} = pid_ets!(registry, partition)
               pid_ets
@@ -1044,8 +1041,7 @@ defmodule Registry do
         for {^pid, value} <- ordered_lookup_second(key_ets, key), do: value
 
       {{:duplicate, _, :ordered}, partitions, _key_ets} ->
-        partition = hash(pid, partitions)
-        key_ets = key_ets!(registry, partition)
+        key_ets = key_ets!(registry, key, partitions)
         for {^pid, value} <- ordered_lookup_second(key_ets, key), do: value
 
       {{:duplicate, _}, 1, key_ets} ->
@@ -1556,10 +1552,7 @@ defmodule Registry do
 
       {{:duplicate, _, :ordered}, partitions, _key_ets} ->
         spec = ordered_count_match_spec(key, pattern, guards)
-
-        Enum.sum_by(0..(partitions - 1), fn partition_index ->
-          :ets.select_count(key_ets!(registry, partition_index), spec)
-        end)
+        :ets.select_count(key_ets!(registry, key, partitions), spec)
 
       {{:duplicate, _}, 1, key_ets} ->
         guards = [{:"=:=", {:element, 1, :"$_"}, {:const, key}} | guards]
@@ -1829,8 +1822,8 @@ defmodule Registry do
     {partition, partition}
   end
 
-  defp partitions({:duplicate, :pid, :ordered}, _key, pid, partitions) do
-    partition = hash(pid, partitions)
+  defp partitions({:duplicate, :key, :ordered}, key, _pid, partitions) do
+    partition = hash(key, partitions)
     {partition, partition}
   end
 
